@@ -5,11 +5,13 @@ import { Server } from "socket.io";
 
 // ===== Config =====
 const PORT = process.env.PORT || 3000;
-const ADMIN_KEY = process.env.ADMIN_KEY || "change-me"; // set in env
-const ROUND_SECONDS = parseInt(process.env.ROUND_SECONDS || "60", 10);
+const ADMIN_KEY = process.env.ADMIN_KEY || "change-me";
 
-// For MVP: local Pokémon list (replace with full list / API later)
-const POKEMON = [
+// 2 minutes by default
+const ROUND_SECONDS = parseInt(process.env.ROUND_SECONDS || "120", 10);
+
+// Large Pokémon list: replaced at startup via PokéAPI if available
+let POKEMON = [
   "pikachu", "bulbasaur", "charmander", "squirtle", "gengar",
   "eevee", "snorlax", "psyduck", "jigglypuff", "mewtwo"
 ];
@@ -18,28 +20,25 @@ const app = express();
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, roundSeconds: ROUND_SECONDS, pokemonCount: POKEMON.length })
+);
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: true, credentials: true }
-});
+const io = new Server(server, { cors: { origin: true, credentials: true } });
 
-// ===== In-memory state (OK for MVP; use Redis for production/multi-instance) =====
+// ===== In-memory state (MVP) =====
 /**
  * lobbies[lobbyId] = {
  *   lobbyId,
  *   adminSocketId,
  *   round: { pokemon, startedAtMs, endsAtMs, active },
+ *   roundTimer: Timeout | null,
  *   scores: { [playerId]: number },
  *   players: { [socketId]: { name, playerId } }
  * }
  */
 const lobbies = new Map();
-
-function randomPokemon() {
-  return POKEMON[Math.floor(Math.random() * POKEMON.length)];
-}
 
 function now() {
   return Date.now();
@@ -50,30 +49,34 @@ function sanitizeName(name) {
   return n || "Player";
 }
 
-function makeLobbyId() {
-  return Math.random().toString(36).slice(2, 8).toUpperCase();
-}
-
 function getLobby(lobbyId) {
   return lobbies.get(lobbyId);
 }
 
-function lobbySnapshot(lobby) {
-  const scores = Object.entries(lobby.scores).map(([playerId, score]) => ({
-    playerId,
-    score
-  }));
-  scores.sort((a, b) => b.score - a.score);
+function createLobby(lobbyIdOverride) {
+  const lobbyId = String(lobbyIdOverride || Math.random().toString(36).slice(2, 8))
+    .trim()
+    .toUpperCase();
 
+  const lobby = {
+    lobbyId,
+    adminSocketId: null,
+    round: null,
+    roundTimer: null,
+    scores: {},
+    players: {}
+  };
+
+  lobbies.set(lobbyId, lobby);
+  return lobby;
+}
+
+function lobbySnapshot(lobby) {
   return {
     lobbyId: lobby.lobbyId,
     hasAdmin: Boolean(lobby.adminSocketId),
     round: lobby.round
-      ? {
-          active: lobby.round.active,
-          startedAtMs: lobby.round.startedAtMs,
-          endsAtMs: lobby.round.endsAtMs
-        }
+      ? { active: lobby.round.active, startedAtMs: lobby.round.startedAtMs, endsAtMs: lobby.round.endsAtMs }
       : { active: false },
     players: Object.values(lobby.players).map(p => ({
       name: p.name,
@@ -83,17 +86,37 @@ function lobbySnapshot(lobby) {
   };
 }
 
-function createLobby() {
-  const lobbyId = makeLobbyId();
-  const lobby = {
-    lobbyId,
-    adminSocketId: null,
-    round: null,
-    scores: {},
-    players: {}
-  };
-  lobbies.set(lobbyId, lobby);
-  return lobby;
+function randomPokemon() {
+  return POKEMON[Math.floor(Math.random() * POKEMON.length)];
+}
+
+// Normalize guesses/answers so "Mr Mime" matches "mr-mime", etc.
+function normalizePokemonName(s) {
+  return String(s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function clearLobbyTimer(lobby) {
+  if (lobby.roundTimer) {
+    clearTimeout(lobby.roundTimer);
+    lobby.roundTimer = null;
+  }
+}
+
+function scheduleRoundEnd(lobby) {
+  clearLobbyTimer(lobby);
+
+  const t = now();
+  const endsAt = lobby.round?.endsAtMs || t;
+  const delay = Math.max(0, endsAt - t) + 50;
+
+  lobby.roundTimer = setTimeout(() => {
+    const freshLobby = getLobby(lobby.lobbyId);
+    if (!freshLobby?.round?.active) return;
+    endRound(freshLobby, { reason: "time" });
+  }, delay);
 }
 
 function startRound(lobby) {
@@ -103,29 +126,21 @@ function startRound(lobby) {
 
   lobby.round = { pokemon, startedAtMs, endsAtMs, active: true };
 
-  // Tell everyone round started (but only admin gets the answer)
-  io.to(lobby.lobbyId).emit("round_started", {
-    startedAtMs,
-    endsAtMs
-  });
+  io.to(lobby.lobbyId).emit("round_started", { startedAtMs, endsAtMs });
 
   if (lobby.adminSocketId) {
     io.to(lobby.adminSocketId).emit("admin_answer", { pokemon });
   }
 
-  // Clear canvas for everyone
   io.to(lobby.lobbyId).emit("canvas_clear");
 
-  // End round timer
-  setTimeout(() => {
-    const freshLobby = getLobby(lobby.lobbyId);
-    if (!freshLobby?.round?.active) return;
-    endRound(freshLobby, { reason: "time" });
-  }, ROUND_SECONDS * 1000 + 50);
+  scheduleRoundEnd(lobby);
 }
 
 function endRound(lobby, { reason, winnerPlayerId } = {}) {
   if (!lobby.round?.active) return;
+
+  clearLobbyTimer(lobby);
 
   const pokemon = lobby.round.pokemon;
   lobby.round.active = false;
@@ -138,43 +153,37 @@ function endRound(lobby, { reason, winnerPlayerId } = {}) {
 }
 
 function awardPoints(lobby, playerId) {
-  // Points based on remaining time: faster guess => more points
   const t = now();
   const remainingMs = Math.max(0, (lobby.round?.endsAtMs || t) - t);
   const remainingSec = remainingMs / 1000;
 
-  // Example scoring: 100 max down to 10 min
   const points = Math.max(10, Math.ceil((remainingSec / ROUND_SECONDS) * 100));
   lobby.scores[playerId] = (lobby.scores[playerId] || 0) + points;
-
   return points;
 }
 
-io.on("connection", (socket) => {
-  // Client -> join lobby
-  socket.on("join_lobby", ({ lobbyId, name, playerId }) => {
-    lobbyId = String(lobbyId || "").trim().toUpperCase();
+// Load big Pokémon list from PokéAPI at startup (700+)
+async function loadPokemonList() {
+  try {
+    const res = await fetch("https://pokeapi.co/api/v2/pokemon?limit=10000");
+    if (!res.ok) throw new Error(`PokéAPI HTTP ${res.status}`);
+    const data = await res.json();
 
-    let lobby = getLobby(lobbyId);
-    if (!lobby) {
-      // For MVP: auto-create if not exist
-      lobby = createLobby();
-      // If user typed a non-existing lobby, keep their typed id? We won't; we return actual id.
-      // Better UX: create lobby only via "create_lobby" event.
+    const names = (data.results || []).map(r => r.name).filter(Boolean);
+
+    if (names.length >= 700) {
+      POKEMON = names;
+      console.log(`Loaded ${POKEMON.length} Pokémon names from PokéAPI`);
+    } else {
+      console.log(`PokéAPI returned only ${names.length}; keeping fallback list`);
     }
+  } catch (e) {
+    console.log("Failed to load PokéAPI list; using fallback list. Error:", e.message);
+  }
+}
 
-    const cleanName = sanitizeName(name);
-    const cleanPlayerId = String(playerId || socket.id).slice(0, 40);
-
-    socket.join(lobby.lobbyId);
-    lobby.players[socket.id] = { name: cleanName, playerId: cleanPlayerId };
-    lobby.scores[cleanPlayerId] = lobby.scores[cleanPlayerId] || 0;
-
-    socket.emit("lobby_joined", lobbySnapshot(lobby));
-    io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
-  });
-
-  // Create a brand new lobby (preferred)
+io.on("connection", (socket) => {
+  // Create lobby with random code (still supported)
   socket.on("create_lobby", ({ name, playerId }) => {
     const lobby = createLobby();
 
@@ -183,23 +192,55 @@ io.on("connection", (socket) => {
 
     socket.join(lobby.lobbyId);
     lobby.players[socket.id] = { name: cleanName, playerId: cleanPlayerId };
-    lobby.scores[cleanPlayerId] = 0;
+    lobby.scores[cleanPlayerId] = lobby.scores[cleanPlayerId] || 0;
 
     socket.emit("lobby_created", lobbySnapshot(lobby));
     io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
   });
 
-  // Become admin (host)
+  // ✅ Anyone can create a lobby by just entering a code and joining
+  socket.on("join_lobby", ({ lobbyId, name, playerId }) => {
+    lobbyId = String(lobbyId || "").trim().toUpperCase();
+    if (!lobbyId) return socket.emit("error_msg", { message: "Missing lobby code." });
+
+    let lobby = getLobby(lobbyId);
+    const createdNow = !lobby;
+
+    if (!lobby) lobby = createLobby(lobbyId);
+
+    const cleanName = sanitizeName(name);
+    const cleanPlayerId = String(playerId || socket.id).slice(0, 40);
+
+    socket.join(lobby.lobbyId);
+    lobby.players[socket.id] = { name: cleanName, playerId: cleanPlayerId };
+    lobby.scores[cleanPlayerId] = lobby.scores[cleanPlayerId] || 0;
+
+    // If this join created the lobby, tell them it was created (nice UX)
+    if (createdNow) {
+      socket.emit("lobby_created", lobbySnapshot(lobby));
+    } else {
+      socket.emit("lobby_joined", lobbySnapshot(lobby));
+    }
+
+    io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
+
+    // If round active & this socket is admin, resend answer (edge case)
+    if (lobby.round?.active && lobby.adminSocketId === socket.id) {
+      socket.emit("admin_answer", { pokemon: lobby.round.pokemon });
+    }
+  });
+
+  // Claim admin (host)
   socket.on("claim_admin", ({ lobbyId, adminKey }) => {
     const lobby = getLobby(String(lobbyId || "").trim().toUpperCase());
     if (!lobby) return socket.emit("error_msg", { message: "Lobby not found." });
     if (adminKey !== ADMIN_KEY) return socket.emit("error_msg", { message: "Bad admin key." });
 
     lobby.adminSocketId = socket.id;
+
     socket.emit("admin_claimed", { ok: true });
     io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
 
-    // If a round is active, send answer
     if (lobby.round?.active) {
       socket.emit("admin_answer", { pokemon: lobby.round.pokemon });
     }
@@ -216,14 +257,46 @@ io.on("connection", (socket) => {
     io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
   });
 
+  // Admin rerolls Pokémon anytime (optionally resets timer)
+  socket.on("reroll_pokemon", ({ lobbyId, resetTimer }) => {
+    const lobby = getLobby(String(lobbyId || "").trim().toUpperCase());
+    if (!lobby) return;
+    if (lobby.adminSocketId !== socket.id) return;
+    if (!lobby.round?.active) return;
+
+    lobby.round.pokemon = randomPokemon();
+
+    const doResetTimer = resetTimer !== false;
+    if (doResetTimer) {
+      const startedAtMs = now();
+      lobby.round.startedAtMs = startedAtMs;
+      lobby.round.endsAtMs = startedAtMs + ROUND_SECONDS * 1000;
+      scheduleRoundEnd(lobby);
+    }
+
+    io.to(lobby.lobbyId).emit("canvas_clear");
+    io.to(lobby.lobbyId).emit("round_started", {
+      startedAtMs: lobby.round.startedAtMs,
+      endsAtMs: lobby.round.endsAtMs
+    });
+
+    io.to(lobby.adminSocketId).emit("admin_answer", { pokemon: lobby.round.pokemon });
+
+    io.to(lobby.lobbyId).emit("chat_msg", {
+      name: "SYSTEM",
+      message: "Host rerolled the Pokémon!"
+    });
+
+    io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
+  });
+
   // Admin drawing events broadcast to lobby
   socket.on("draw_stroke", ({ lobbyId, stroke }) => {
     const lobby = getLobby(String(lobbyId || "").trim().toUpperCase());
     if (!lobby) return;
-    if (lobby.adminSocketId !== socket.id) return; // only admin can draw
+    if (lobby.adminSocketId !== socket.id) return;
     if (!lobby.round?.active) return;
 
-    // stroke: {x0,y0,x1,y1,color,width}
     socket.to(lobby.lobbyId).emit("draw_stroke", { stroke });
   });
 
@@ -231,6 +304,7 @@ io.on("connection", (socket) => {
     const lobby = getLobby(String(lobbyId || "").trim().toUpperCase());
     if (!lobby) return;
     if (lobby.adminSocketId !== socket.id) return;
+
     io.to(lobby.lobbyId).emit("canvas_clear");
   });
 
@@ -242,19 +316,18 @@ io.on("connection", (socket) => {
     const p = lobby.players[socket.id];
     if (!p) return;
 
-    const cleanGuess = String(guess || "").trim().toLowerCase().slice(0, 40);
-    if (!cleanGuess) return;
+    const rawGuess = String(guess || "").trim().slice(0, 60);
+    const cleanGuessChat = rawGuess.toLowerCase();
+    if (!cleanGuessChat) return;
 
-    // Broadcast guess to chat
-    io.to(lobby.lobbyId).emit("chat_msg", {
-      name: p.name,
-      message: cleanGuess
-    });
+    io.to(lobby.lobbyId).emit("chat_msg", { name: p.name, message: cleanGuessChat });
 
     if (!lobby.round?.active) return;
 
-    const answer = lobby.round.pokemon.toLowerCase();
-    if (cleanGuess === answer) {
+    const answerNorm = normalizePokemonName(lobby.round.pokemon);
+    const guessNorm = normalizePokemonName(rawGuess);
+
+    if (guessNorm && guessNorm === answerNorm) {
       const points = awardPoints(lobby, p.playerId);
 
       io.to(lobby.lobbyId).emit("correct_guess", {
@@ -269,14 +342,12 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    // Remove player from any lobby they were in
     for (const lobby of lobbies.values()) {
       if (lobby.players[socket.id]) {
         delete lobby.players[socket.id];
 
         if (lobby.adminSocketId === socket.id) {
           lobby.adminSocketId = null;
-          // Optionally end round if admin leaves:
           if (lobby.round?.active) endRound(lobby, { reason: "admin_left" });
         }
 
@@ -286,6 +357,11 @@ io.on("connection", (socket) => {
   });
 });
 
+// Startup
+await loadPokemonList();
+
 server.listen(PORT, () => {
   console.log(`PokeDraw server running on port ${PORT}`);
+  console.log(`Round length: ${ROUND_SECONDS}s`);
+  console.log(`Pokémon loaded: ${POKEMON.length}`);
 });
