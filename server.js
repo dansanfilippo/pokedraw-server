@@ -5,7 +5,6 @@ import { Server } from "socket.io";
 
 // ===== Config =====
 const PORT = process.env.PORT || 3000;
-const ADMIN_KEY = process.env.ADMIN_KEY || "change-me";
 
 // 2 minutes by default
 const ROUND_SECONDS = parseInt(process.env.ROUND_SECONDS || "120", 10);
@@ -32,6 +31,7 @@ const io = new Server(server, { cors: { origin: true, credentials: true } });
  * lobbies[lobbyId] = {
  *   lobbyId,
  *   adminSocketId,
+ *   hostToken, // string, per-lobby secret that lets you claim host
  *   round: { pokemon, startedAtMs, endsAtMs, active },
  *   roundTimer: Timeout | null,
  *   scores: { [playerId]: number },
@@ -61,6 +61,7 @@ function createLobby(lobbyIdOverride) {
   const lobby = {
     lobbyId,
     adminSocketId: null,
+    hostToken: null,
     round: null,
     roundTimer: null,
     scores: {},
@@ -90,7 +91,7 @@ function randomPokemon() {
   return POKEMON[Math.floor(Math.random() * POKEMON.length)];
 }
 
-// Normalize guesses/answers (kept for robustness; answers will now be simple alnum)
+// Normalize guesses/answers (answers are simple alnum, but keep for robustness)
 function normalizePokemonName(s) {
   return String(s || "")
     .toLowerCase()
@@ -133,7 +134,6 @@ function startRound(lobby) {
   }
 
   io.to(lobby.lobbyId).emit("canvas_clear");
-
   scheduleRoundEnd(lobby);
 }
 
@@ -162,15 +162,12 @@ function awardPoints(lobby, playerId) {
   return points;
 }
 
-// ✅ Keep only "simple" Pokémon names: letters/numbers only, no dashes, no punctuation, no spaces.
-// This also removes most special forms (because PokéAPI forms are almost always hyphenated).
+// ✅ Only "simple" Pokémon names: letters/numbers only (no dashes/forms)
 function isSimplePokemonName(name) {
-  // Examples kept: pikachu, charizard, porygon2
-  // Examples removed: mr-mime, ho-oh, deoxys-normal, rotom-wash, etc.
   return /^[a-z0-9]+$/.test(name);
 }
 
-// Load big Pokémon list from PokéAPI at startup (filtered to simple names)
+// Load big Pokémon list from PokéAPI at startup (filtered)
 async function loadPokemonList() {
   try {
     const res = await fetch("https://pokeapi.co/api/v2/pokemon?limit=10000");
@@ -182,7 +179,6 @@ async function loadPokemonList() {
       .filter(Boolean)
       .filter(isSimplePokemonName);
 
-    // De-dupe just in case
     const unique = Array.from(new Set(names));
 
     if (unique.length >= 700) {
@@ -196,9 +192,26 @@ async function loadPokemonList() {
   }
 }
 
+// ===== Host token logic =====
+function isValidToken(t) {
+  // keep it lenient; client generates it
+  return typeof t === "string" && t.length >= 12 && t.length <= 200;
+}
+
+function canClaimHost(lobby, token) {
+  if (!isValidToken(token)) return { ok: false, msg: "Missing host token." };
+
+  // If no token set yet (old lobby), first claimer sets it
+  if (!lobby.hostToken) return { ok: true, setsToken: true };
+
+  if (token === lobby.hostToken) return { ok: true, setsToken: false };
+
+  return { ok: false, msg: "Invalid host token for this lobby." };
+}
+
 io.on("connection", (socket) => {
-  // Create lobby with random code (still supported)
-  socket.on("create_lobby", ({ name, playerId }) => {
+  // Create lobby with random code
+  socket.on("create_lobby", ({ name, playerId, hostToken }) => {
     const lobby = createLobby();
 
     const cleanName = sanitizeName(name);
@@ -208,12 +221,19 @@ io.on("connection", (socket) => {
     lobby.players[socket.id] = { name: cleanName, playerId: cleanPlayerId };
     lobby.scores[cleanPlayerId] = lobby.scores[cleanPlayerId] || 0;
 
+    // Creator becomes host if token valid; otherwise they can still play but won't be host
+    if (isValidToken(hostToken)) {
+      lobby.hostToken = hostToken;
+      lobby.adminSocketId = socket.id;
+      socket.emit("admin_claimed", { ok: true });
+    }
+
     socket.emit("lobby_created", lobbySnapshot(lobby));
     io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
   });
 
-  // Anyone can create a lobby by entering a code and joining
-  socket.on("join_lobby", ({ lobbyId, name, playerId }) => {
+  // Join lobby (creates lobby if code doesn't exist)
+  socket.on("join_lobby", ({ lobbyId, name, playerId, hostToken }) => {
     lobbyId = String(lobbyId || "").trim().toUpperCase();
     if (!lobbyId) return socket.emit("error_msg", { message: "Missing lobby code." });
 
@@ -229,21 +249,49 @@ io.on("connection", (socket) => {
     lobby.players[socket.id] = { name: cleanName, playerId: cleanPlayerId };
     lobby.scores[cleanPlayerId] = lobby.scores[cleanPlayerId] || 0;
 
-    if (createdNow) socket.emit("lobby_created", lobbySnapshot(lobby));
-    else socket.emit("lobby_joined", lobbySnapshot(lobby));
+    // If this join created the lobby, set token and make them host (if token provided)
+    if (createdNow) {
+      if (isValidToken(hostToken)) {
+        lobby.hostToken = hostToken;
+        lobby.adminSocketId = socket.id;
+        socket.emit("admin_claimed", { ok: true });
+      }
+      socket.emit("lobby_created", lobbySnapshot(lobby));
+    } else {
+      // If lobby exists and has no admin, allow auto-claim ONLY if token matches
+      if (!lobby.adminSocketId && isValidToken(hostToken) && lobby.hostToken && hostToken === lobby.hostToken) {
+        lobby.adminSocketId = socket.id;
+        socket.emit("admin_claimed", { ok: true });
+      }
+      socket.emit("lobby_joined", lobbySnapshot(lobby));
+    }
 
     io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
+
+    // If they are now admin and round active, send answer
+    if (lobby.round?.active && lobby.adminSocketId === socket.id) {
+      socket.emit("admin_answer", { pokemon: lobby.round.pokemon });
+    }
   });
 
-  // Claim admin (host)
-  socket.on("claim_admin", ({ lobbyId, adminKey }) => {
+  // Claim host (token required)
+  socket.on("claim_admin", ({ lobbyId, hostToken }) => {
     const lobby = getLobby(String(lobbyId || "").trim().toUpperCase());
     if (!lobby) return socket.emit("error_msg", { message: "Lobby not found." });
-    if (adminKey !== ADMIN_KEY) return socket.emit("error_msg", { message: "Bad admin key." });
+
+    // If someone else is currently host, deny (even if token matches) — keeps it simple/clean
+    if (lobby.adminSocketId && lobby.adminSocketId !== socket.id) {
+      return socket.emit("error_msg", { message: "This lobby already has a host." });
+    }
+
+    const verdict = canClaimHost(lobby, hostToken);
+    if (!verdict.ok) return socket.emit("error_msg", { message: verdict.msg });
+
+    if (verdict.setsToken) lobby.hostToken = hostToken;
 
     lobby.adminSocketId = socket.id;
-
     socket.emit("admin_claimed", { ok: true });
+
     io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
 
     if (lobby.round?.active) {
@@ -351,9 +399,16 @@ io.on("connection", (socket) => {
       if (lobby.players[socket.id]) {
         delete lobby.players[socket.id];
 
+        // If host left, clear admin (token remains so they can reclaim later)
         if (lobby.adminSocketId === socket.id) {
           lobby.adminSocketId = null;
+
           if (lobby.round?.active) endRound(lobby, { reason: "admin_left" });
+
+          io.to(lobby.lobbyId).emit("chat_msg", {
+            name: "SYSTEM",
+            message: "Host disconnected. Original host can reclaim."
+          });
         }
 
         io.to(lobby.lobbyId).emit("lobby_update", lobbySnapshot(lobby));
